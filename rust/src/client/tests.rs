@@ -77,6 +77,49 @@ fn config_literal_from_1_0_1_still_compiles() {
 }
 
 #[tokio::test]
+async fn replay_reconnect_delivers_payload_after_user_slot_tick() {
+    assert_replay_resume(Reply::ReplayGap, 91, vec![91, 92]).await;
+}
+
+#[tokio::test]
+async fn replay_reconnect_delivers_payload_after_matching_slot_tick() {
+    assert_replay_resume(Reply::MatchingReplayGap, 91, vec![91, 92]).await;
+}
+
+#[tokio::test]
+async fn replay_quiet_subscription_keeps_current_resume_position() {
+    assert_replay_resume(Reply::Quiet, 122, vec![91, 123]).await;
+}
+
+async fn assert_replay_resume(reply: Reply, expected_cursor: u64, expected_slots: Vec<u64>) {
+    let server = TestServer::start(reply).await;
+    let mut req = request();
+    req.from_slot = Some(90);
+    req.commitment = Some(CommitmentLevel::Confirmed as i32);
+    req.slots.insert("user".into(), SubscribeRequestFilterSlots {
+        filter_by_commitment: Some(!matches!(reply, Reply::ReplayGap)),
+        ..Default::default()
+    });
+    let options = SubscribeOptions::default().with_intra_slot_updates(true);
+    let (stream, _handle) = subscribe_with_options(server.config(), req, options);
+    futures::pin_mut!(stream);
+    let delivered = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut slots = Vec::new();
+        while let Some(update) = stream.next().await {
+            let update = update.expect("quiet resume must remain inside the replay window");
+            if let Some(UpdateOneof::Account(account)) = update.update_oneof {
+                slots.push(account.slot);
+                if slots.len() == 2 { break; }
+            }
+        }
+        slots
+    }).await.unwrap();
+    assert_eq!(server.requests.lock().unwrap()[1].from_slot, Some(expected_cursor),
+        "incorrect resume position: must preserve pending slot 92 and keep quiet streams current");
+    assert_eq!(delivered, expected_slots);
+}
+
+#[tokio::test]
 async fn stream_out_of_range_is_terminal() {
     assert_terminal(Reply::StreamOutOfRange, Code::OutOfRange, 1).await;
 }
@@ -192,6 +235,9 @@ async fn unary_connect_fails_for_unreachable_endpoint() {
 
 #[derive(Clone, Copy, Debug)]
 enum Reply {
+    ReplayGap,
+    MatchingReplayGap,
+    Quiet,
     StreamOutOfRange,
     InitialOutOfRange,
     Data,
@@ -255,6 +301,39 @@ impl geyser_server::Geyser for TestGeyser {
         };
         if matches!(self.reply, Reply::InitialOutOfRange) {
             return Err(Status::out_of_range(SLOT_TOO_OLD_MESSAGE));
+        }
+        if matches!(self.reply, Reply::ReplayGap | Reply::MatchingReplayGap | Reply::Quiet) {
+            if attempt > 1 && matches!(self.reply, Reply::Quiet)
+                && first.from_slot.unwrap_or(0) < 120 {
+                return Err(Status::out_of_range("first available slot is 120"));
+            }
+            let account = |slot| Ok(SubscribeUpdate {
+                filters: vec!["accounts".into()],
+                update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
+                    slot, ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let updates = if attempt == 1 {
+                vec![account(91), Ok(SubscribeUpdate {
+                    filters: vec!["user".into()],
+                    update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                        slot: 122,
+                        status: if matches!(self.reply, Reply::ReplayGap) {
+                            CommitmentLevel::Processed as i32
+                        } else {
+                            CommitmentLevel::Confirmed as i32
+                        },
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })]
+            } else if first.from_slot.unwrap_or(0) <= 92 {
+                vec![account(92)]
+            } else {
+                vec![account(123)]
+            };
+            return Ok(Response::new(Box::pin(futures::stream::iter(updates)) as Updates));
         }
         let update = match self.reply {
             Reply::StreamOutOfRange => Err(Status::out_of_range(SLOT_TOO_OLD_MESSAGE)),
